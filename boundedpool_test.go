@@ -14,7 +14,6 @@ import (
 	"github.com/colduction/boundedpool-go"
 )
 
-// Helper function to create a simple pool for testing
 func createTestPool(capacity int) (boundedpool.Pooler[*bytes.Buffer], error) {
 	factory := func() *bytes.Buffer {
 		return new(bytes.Buffer)
@@ -22,7 +21,6 @@ func createTestPool(capacity int) (boundedpool.Pooler[*bytes.Buffer], error) {
 	return boundedpool.NewPool(capacity, factory)
 }
 
-// Test creating a pool with valid parameters
 func TestNewPool(t *testing.T) {
 	capacity := 10
 	pool, err := createTestPool(capacity)
@@ -38,19 +36,17 @@ func TestNewPool(t *testing.T) {
 	if pool.Len() != 0 {
 		t.Errorf("Expected initial length 0, got %d", pool.Len())
 	}
-	// Check number of shards (should be power of 2 >= GOMAXPROCS * factor)
 	expectedMinShards := runtime.GOMAXPROCS(0) * boundedpool.DefaultShardFactor
 	actualShards := pool.NumShards()
 	if actualShards < expectedMinShards && actualShards < capacity {
 		t.Logf("Warning: NumShards (%d) is less than expected minimum (%d), possibly due to low capacity (%d)", actualShards, expectedMinShards, capacity)
 	}
-	if (actualShards & (actualShards - 1)) != 0 { // Check if power of 2
+	if (actualShards & (actualShards - 1)) != 0 {
 		t.Errorf("Expected NumShards to be power of 2, got %d", actualShards)
 	}
 	pool.Close()
 }
 
-// Test creating a pool with invalid capacity
 func TestNewPoolInvalidCapacity(t *testing.T) {
 	_, err := createTestPool(0)
 	if err == nil {
@@ -62,7 +58,6 @@ func TestNewPoolInvalidCapacity(t *testing.T) {
 	}
 }
 
-// Test creating a pool with a nil factory
 func TestNewPoolNilFactory(t *testing.T) {
 	_, err := boundedpool.NewPool[*bytes.Buffer](10, nil)
 	if err == nil {
@@ -70,7 +65,6 @@ func TestNewPoolNilFactory(t *testing.T) {
 	}
 }
 
-// Test basic Get and Put operations
 func TestGetPut(t *testing.T) {
 	pool, _ := createTestPool(5)
 	defer pool.Close()
@@ -104,7 +98,6 @@ func TestGetPut(t *testing.T) {
 	pool.Put(item2)
 }
 
-// Test getting an item when the pool is empty (factory should be called)
 func TestGetEmptyPool(t *testing.T) {
 	var factoryCalls int32
 	factory := func() *int {
@@ -127,12 +120,11 @@ func TestGetEmptyPool(t *testing.T) {
 	if atomic.LoadInt32(&factoryCalls) != 1 {
 		t.Errorf("Expected factory to be called 1 time, got %d", factoryCalls)
 	}
-	if pool.Len() != 0 { // Length doesn't increase on Get
+	if pool.Len() != 0 {
 		t.Errorf("Expected length 0 after Get, got %d", pool.Len())
 	}
 }
 
-// Test putting an item when the pool is full
 func TestPutFullPool(t *testing.T) {
 	capacity := 2
 	pool, _ := createTestPool(capacity)
@@ -140,7 +132,7 @@ func TestPutFullPool(t *testing.T) {
 
 	items := make([]*bytes.Buffer, capacity+1)
 	for i := range capacity + 1 {
-		item, err := pool.Get() // Get will create new ones
+		item, err := pool.Get()
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
@@ -156,19 +148,157 @@ func TestPutFullPool(t *testing.T) {
 		t.Fatalf("Expected pool length to be %d, got %d", capacity, pool.Len())
 	}
 
-	// Try to put one more item (should be discarded)
 	err := pool.Put(items[capacity])
 	if err != nil {
 		t.Errorf("Expected Put on full pool to succeed (discard), but got error: %v", err)
 	}
 
-	// Pool length should remain at capacity
 	if pool.Len() != capacity {
 		t.Errorf("Expected pool length to remain %d after putting to full pool, got %d", capacity, pool.Len())
 	}
 }
 
-// Test operations after closing the pool
+func TestPoolRespectsConfiguredCapacity(t *testing.T) {
+	capacity := 5
+	pool, err := createTestPool(capacity)
+	if err != nil {
+		t.Fatalf("failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	items := make([]*bytes.Buffer, capacity*3)
+	for i := range items {
+		item, getErr := pool.Get()
+		if getErr != nil {
+			t.Fatalf("Get failed: %v", getErr)
+		}
+		items[i] = item
+	}
+
+	for _, item := range items {
+		item.Reset()
+		if putErr := pool.Put(item); putErr != nil {
+			t.Fatalf("Put failed: %v", putErr)
+		}
+	}
+
+	if got := pool.Len(); got != capacity {
+		t.Fatalf("pool retained %d items, expected exactly %d", got, capacity)
+	}
+}
+
+func TestNewPoolWithOptionsNormalizesShardCount(t *testing.T) {
+	pool, err := boundedpool.NewPoolWithOptions(
+		10,
+		func() *bytes.Buffer { return new(bytes.Buffer) },
+		boundedpool.WithNumShards[*bytes.Buffer](3),
+	)
+	if err != nil {
+		t.Fatalf("NewPoolWithOptions failed: %v", err)
+	}
+	defer pool.Close()
+
+	if got := pool.NumShards(); got != 4 {
+		t.Fatalf("expected requested shard count to normalize to 4, got %d", got)
+	}
+	if got := pool.Cap(); got != 10 {
+		t.Fatalf("expected configured capacity to remain 10, got %d", got)
+	}
+}
+
+func TestNewPoolWithOptionsClampsShardsToCapacity(t *testing.T) {
+	pool, err := boundedpool.NewPoolWithOptions(
+		3,
+		func() *bytes.Buffer { return new(bytes.Buffer) },
+		boundedpool.WithNumShards[*bytes.Buffer](64),
+	)
+	if err != nil {
+		t.Fatalf("NewPoolWithOptions failed: %v", err)
+	}
+	defer pool.Close()
+
+	if got := pool.NumShards(); got != 2 {
+		t.Fatalf("expected shard count to clamp to previous power of two within capacity, got %d", got)
+	}
+}
+
+func TestPoolResetAndDropHooks(t *testing.T) {
+	var resets atomic.Int32
+	var drops atomic.Int32
+	pool, err := boundedpool.NewPoolWithOptions(
+		1,
+		func() *bytes.Buffer { return new(bytes.Buffer) },
+		boundedpool.WithReset[*bytes.Buffer](func(buf *bytes.Buffer) {
+			resets.Add(1)
+			buf.Reset()
+		}),
+		boundedpool.WithOnDrop[*bytes.Buffer](func(*bytes.Buffer) {
+			drops.Add(1)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewPoolWithOptions failed: %v", err)
+	}
+	defer pool.Close()
+
+	first, err := pool.Get()
+	if err != nil {
+		t.Fatalf("first Get failed: %v", err)
+	}
+	second, err := pool.Get()
+	if err != nil {
+		t.Fatalf("second Get failed: %v", err)
+	}
+	first.WriteString("first")
+	second.WriteString("second")
+
+	if err := pool.Put(first); err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+	if err := pool.Put(second); err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	if got := resets.Load(); got != 2 {
+		t.Fatalf("expected reset hook for both Put calls, got %d", got)
+	}
+	if got := drops.Load(); got != 1 {
+		t.Fatalf("expected one dropped item when capacity is full, got %d", got)
+	}
+
+	reused, err := pool.Get()
+	if err != nil {
+		t.Fatalf("Get after Put failed: %v", err)
+	}
+	if reused.Len() != 0 {
+		t.Fatalf("expected reset buffer to be empty, got len %d", reused.Len())
+	}
+}
+
+func TestNewPoolWithOptionsInvalidOptions(t *testing.T) {
+	factory := func() *bytes.Buffer { return new(bytes.Buffer) }
+	invalidCases := []struct {
+		name string
+		opt  boundedpool.Option[*bytes.Buffer]
+	}{
+		{name: "nil option", opt: nil},
+		{name: "invalid shard factor", opt: boundedpool.WithShardFactor[*bytes.Buffer](0)},
+		{name: "invalid shard count", opt: boundedpool.WithNumShards[*bytes.Buffer](0)},
+		{name: "invalid max scan", opt: boundedpool.WithMaxScan[*bytes.Buffer](-1)},
+		{name: "nil reset", opt: boundedpool.WithReset[*bytes.Buffer](nil)},
+		{name: "nil drop", opt: boundedpool.WithOnDrop[*bytes.Buffer](nil)},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := boundedpool.NewPoolWithOptions(1, factory, tc.opt)
+			if !errors.Is(err, boundedpool.ErrInvalidOption) {
+				t.Fatalf("expected ErrInvalidOption, got %v", err)
+			}
+		})
+	}
+}
+
 func TestPoolClose(t *testing.T) {
 	pool, _ := createTestPool(5)
 	item1, _ := pool.Get()
@@ -182,8 +312,6 @@ func TestPoolClose(t *testing.T) {
 		t.Fatal("Close returned false, expected true")
 	}
 
-	// Verify length is 0 after close
-	// Need a small delay or retry as draining happens concurrently
 	time.Sleep(10 * time.Millisecond)
 	if pool.Len() != 0 {
 		t.Errorf("Expected length 0 after close, got %d", pool.Len())
@@ -203,12 +331,11 @@ func TestPoolClose(t *testing.T) {
 	}
 }
 
-// Test concurrent Get and Put operations
 func TestPoolConcurrency(t *testing.T) {
-	capacity := runtime.GOMAXPROCS(0) * 4 // Capacity relative to cores
+	capacity := runtime.GOMAXPROCS(0) * 4
 	pool, _ := createTestPool(capacity)
 	defer pool.Close()
-	numGoroutines := runtime.GOMAXPROCS(0) * 10 // More goroutines than cores
+	numGoroutines := runtime.GOMAXPROCS(0) * 10
 	numOpsPerGoroutine := 1000
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
@@ -219,7 +346,7 @@ func TestPoolConcurrency(t *testing.T) {
 				item, err := pool.Get()
 				if err != nil {
 					if errors.Is(err, boundedpool.ErrPoolClosed) {
-						return // Pool closed, stop worker
+						return
 					}
 					t.Errorf("Concurrent Get failed: %v", err)
 					return
@@ -244,6 +371,55 @@ func TestPoolConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 	t.Logf("Final pool length after concurrency test: %d/%d", pool.Len(), pool.Cap())
+}
+
+func TestPoolCloseUnderConcurrency(t *testing.T) {
+	pool, _ := createTestPool(runtime.GOMAXPROCS(0) * 4)
+	workers := runtime.GOMAXPROCS(0) * 8
+	const workerOps = 2000
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(workers)
+
+	for range workers {
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < workerOps; i++ {
+				item, err := pool.Get()
+				if err != nil {
+					if errors.Is(err, boundedpool.ErrPoolClosed) {
+						return
+					}
+					t.Errorf("Get failed: %v", err)
+					return
+				}
+				item.Reset()
+				if err = pool.Put(item); err != nil {
+					if errors.Is(err, boundedpool.ErrPoolClosed) {
+						return
+					}
+					t.Errorf("Put failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	time.Sleep(2 * time.Millisecond)
+	if !pool.Close() {
+		t.Fatal("expected Close to return true on first call")
+	}
+	wg.Wait()
+
+	if _, err := pool.Get(); !errors.Is(err, boundedpool.ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed from Get after close, got %v", err)
+	}
+	if err := pool.Put(new(bytes.Buffer)); !errors.Is(err, boundedpool.ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed from Put after close, got %v", err)
+	}
 }
 
 func benchmarkGetPut(b *testing.B, pool boundedpool.Pooler[*bytes.Buffer], numWorkers int) {
@@ -275,7 +451,6 @@ func benchmarkGetPut(b *testing.B, pool boundedpool.Pooler[*bytes.Buffer], numWo
 	})
 }
 
-// Benchmark with different numbers of concurrent workers
 func BenchmarkPoolGetPut(b *testing.B) {
 	capacity := 1024
 	pool, err := createTestPool(capacity)
@@ -291,7 +466,6 @@ func BenchmarkPoolGetPut(b *testing.B) {
 	}
 }
 
-// Benchmark focusing only on Get (when pool might be empty -> factory)
 func BenchmarkPoolGet(b *testing.B) {
 	capacity := 1024
 	pool, err := createTestPool(capacity)
@@ -322,7 +496,6 @@ func BenchmarkPoolGet(b *testing.B) {
 	})
 }
 
-// Benchmark focusing only on Put (when pool might be full)
 func BenchmarkPoolPut(b *testing.B) {
 	capacity := 1024
 	pool, err := createTestPool(capacity)
@@ -342,10 +515,8 @@ func BenchmarkPoolPut(b *testing.B) {
 	})
 }
 
-// BenchmarkPoolAllocations measures memory allocations during Get/Put cycles.
-// Expect low allocations (ideally 0 allocs/op) once the pool is warm.
 func BenchmarkPoolAllocations(b *testing.B) {
-	capacity := 128 // Smaller capacity to ensure reuse happens quickly
+	capacity := 128
 	pool, err := createTestPool(capacity)
 	if err != nil {
 		b.Fatalf("Failed to create pool: %v", err)
